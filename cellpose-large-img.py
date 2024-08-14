@@ -2,7 +2,10 @@
 #                              Process large image                             #
 # ---------------------------------------------------------------------------- #
 import argparse
+import concurrent.futures
 import datetime
+import gc
+import itertools
 import pathlib
 import sys
 import time
@@ -10,10 +13,13 @@ import time
 import cellpose.denoise
 import dask.array as da
 import dask.diagnostics
-import dask_image.ndmeasure
+import numcodecs
 import palom
-import scipy.ndimage as ndi
 import skimage.exposure
+import skimage.segmentation
+import tifffile
+import torch.cuda
+import tqdm
 import zarr
 import numpy as np
 
@@ -39,14 +45,7 @@ def segment_tile(timg, dn_model):
         tile=True,
     )[0]
 
-    if np.all(tmask == 0):
-        return tmask.astype("bool")
-
-    struct_elem = ndi.generate_binary_structure(tmask.ndim, 1)
-    contour = ndi.grey_dilation(tmask, footprint=struct_elem) != ndi.grey_erosion(
-        tmask, footprint=struct_elem
-    )
-    return (tmask > 0) & ~contour
+    return tmask
 
 
 def da_to_zarr(da_img, zarr_store=None, num_workers=None, out_shape=None, chunks=None):
@@ -74,10 +73,24 @@ def main():
     )
     parser.add_argument(
         '-c', '--channel',
-        nargs=1,
         type=int,
         required=True,
         help='DNA channel to segment (1-based)',
+    )
+    parser.add_argument(
+        '--use-gpu',
+        action='store_true',
+        help='Enable GPU-based processing for CellPose (default: no, use CPU)'
+    )
+    parser.add_argument(
+        '--jobs',
+        default=1,
+        type=int,
+        help='Number of jobs to run simultaneously when using GPU processing'
+        ' (default: 1). Increase this value by 1 until your GPU reaches ~100%%'
+        ' utilization. Higher values than this will only waste RAM and VRAM'
+        ' without providing a speedup. CPU processing is already implicitly'
+        ' parallelized and will automatically use all available CPUs.',
     )
     args = parser.parse_args()
 
@@ -88,6 +101,12 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    if args.jobs > 1 and not args.use_gpu:
+        print(
+            "ERROR: can't use --jobs without --use-gpu (CPU mode is already"
+            " implicitly parallelized; see --help output for details)"
+        )
+        sys.exit(1)
 
     start = int(time.perf_counter())
 
@@ -95,26 +114,53 @@ def main():
     img = reader.pyramid[0][0]
     dn_model = cellpose.denoise.CellposeDenoiseModel(
         # this seems to be the best atm
-        gpu=True,
-        model_type="cyto3",
-        restore_type="deblur_cyto3",
+        gpu=args.use_gpu,
+        model_type='cyto3',
+        restore_type='deblur_cyto3',
     )
 
-    _binary_mask = img.map_overlap(
-        segment_tile,
-        depth={0: 128, 1: 128},
-        boundary="none",
-        dtype=bool,
-        dn_model=dn_model,
+    tw = 2048
+    overlap = 128
+
+    step = tw - overlap
+    ys = np.arange(0, img.shape[0], step)
+    xs = np.arange(0, img.shape[1], step)
+    labels_full = zarr.open(
+        'temp.zarr',
+        mode='w',
+        shape=img.shape,
+        chunks=(tw, tw),
+        dtype=np.uint32,
+        compressor=numcodecs.Zstd(),
     )
-    _binary_mask = da_to_zarr(_binary_mask, num_workers=6)
-    binary_mask = da.from_zarr(_binary_mask)
+    n_masks = 0
+
+    def work(y, x):
+        return segment_tile(img[y : y + tw, x : x + tw], dn_model)
+
+    pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
+    futures = {
+        (y, x): pool.submit(work, y, x)
+        for y, x in itertools.product(ys, xs)
+    }
+    for (y, x), f in tqdm.tqdm(futures.items()):
+        labels = f.result()
+        lf_view = labels_full[y : y + tw, x : x + tw]
+        lh, lw = labels.shape
+        for prop in skimage.measure.regionprops(labels):
+            bb = prop.bbox
+            if bb[0] == 0 or bb[1] == 0 or bb[2] == lh or bb[3] == lw:
+                continue
+            if lf_view[prop.slice][prop.image].any():
+                continue
+            n_masks += 1
+            lf_view[prop.slice][prop.image] = n_masks
+        labels_full[y : y + tw, x : x + tw] = lf_view
 
     end = int(time.perf_counter())
     print("\nelapsed (cellpose):", datetime.timedelta(seconds=end - start))
 
-    _labeled_mask = dask_image.ndmeasure.label(binary_mask)[0]
-    labeled_mask = da_to_zarr(_labeled_mask)
+    labeled_mask = labels_full
 
     end = int(time.perf_counter())
     print("\nelapsed (label):", datetime.timedelta(seconds=end - start))
