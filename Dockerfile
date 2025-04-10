@@ -11,7 +11,6 @@ RUN pip install --no-cache-dir \
     dask \
     scipy \
     numpy \
-    dask-image \
     palom
 
 COPY /cellpose-large-img.py /app/

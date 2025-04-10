@@ -13,12 +13,13 @@ import time
 import cellpose.denoise
 import dask.array as da
 import dask.diagnostics
-import dask_image.ndmeasure as dim
 import numcodecs
 import ome_types
 import palom
 import skimage.exposure
 import skimage.segmentation
+import sklearn.mixture
+import threadpoolctl
 import tifffile
 import torch.cuda
 import tqdm
@@ -26,21 +27,13 @@ import zarr
 import numpy as np
 
 
-def segment_tile(timg, dn_model, cytoplasm_thickness):
-    # timg = skimage.exposure.adjust_gamma(
-    #     skimage.exposure.rescale_intensity(
-    #         timg, in_range=(500, 40_000), out_range="float"
-    #     ),
-    #     0.7,
-    # )
+def segment_tile(timg, dn_model, intensity_max, cytoplasm_thickness):
     timg = skimage.exposure.rescale_intensity(
-        timg, in_range=(500, 40_000), out_range="float"
+        timg, in_range=(0, intensity_max), out_range="float"
     )
     labels_nucleus = dn_model.eval(
         timg,
-        diameter=15.0,
-        channels=[0, 0],
-        # inputs are globally normalized already
+        diameter=17.0,
         normalize=False,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
@@ -62,6 +55,37 @@ def da_to_zarr(da_img, zarr_store=None, num_workers=None, out_shape=None, chunks
     with dask.diagnostics.ProgressBar():
         da_img.to_zarr(zarr_store, compute=False).compute(num_workers=2)
     return zarr_store
+
+
+def auto_threshold(img):
+
+    assert img.ndim == 2
+
+    yi, xi = np.floor(np.linspace(0, img.shape, 200, endpoint=False)).astype(int).T
+    # Slice one dimension at a time. Should generally use less memory than a meshgrid.
+    img = img[yi]
+    img = img[:, xi]
+    img_log = np.log(img[img > 0]).compute()
+    gmm = sklearn.mixture.GaussianMixture(3, max_iter=1000, tol=1e-6)
+    gmm.fit(img_log.reshape((-1,1)))
+    means = gmm.means_[:, 0]
+    _, _, i = np.argsort(means)
+    mean = means[i]
+    std = gmm.covariances_[i, 0, 0] ** 0.5
+
+    lmax = mean + 2 * std
+    vmax = min(np.exp(lmax), img.max())
+
+    return vmax
+
+
+def get_low_res(reader):
+    """Return a low resolution pyramid level, at least 200x200 px for auto_threshold"""
+
+    for img in reversed(reader.pyramid):
+        if all(s >= 200 for s in img.shape[1:3]):
+            return img
+    return reader.pyramid[0]
 
 
 def main():
@@ -103,6 +127,10 @@ def main():
         help='Enable GPU-based processing for CellPose (default: no, use CPU)'
     )
     parser.add_argument(
+        '--output-discard',
+        help='Discard mask output image',
+    )
+    parser.add_argument(
         '--jobs',
         default=1,
         type=int,
@@ -130,15 +158,13 @@ def main():
 
     start = int(time.perf_counter())
 
+    threadpoolctl.threadpool_limits(1)
+
     reader = palom.reader.OmePyramidReader(args.input)
-    img = reader.pyramid[0][0]
+    img = reader.pyramid[0][args.channel - 1]
     expand_size_px = round(args.expand_size / reader.pixel_size)
-    dn_model = cellpose.denoise.CellposeDenoiseModel(
-        # this seems to be the best atm
-        gpu=args.use_gpu,
-        model_type='cyto3',
-        restore_type='deblur_cyto3',
-    )
+    intensity_max = auto_threshold(img)
+    dn_model = cellpose.models.CellposeModel(gpu=args.use_gpu, model_type='nuclei')
 
     tw = args.tile_width
     overlap = round(args.tile_overlap / reader.pixel_size)
@@ -164,17 +190,22 @@ def main():
     )
     num_masks = 0
 
+    def get_tile(arr, y, x):
+        return arr[y : y + tw, x : x + tw]
+
     def work(y, x):
         return segment_tile(
-            img[y : y + tw, x : x + tw], dn_model, expand_size_px
+            get_tile(img, y, x), dn_model, intensity_max, expand_size_px
         )
 
     pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
     futures = {
-        (y, x): pool.submit(work, y, x)
+        pool.submit(work, y, x): (y, x)
         for y, x in itertools.product(ys, xs)
     }
-    for (y, x), f in tqdm.tqdm(futures.items()):
+    f_iter = concurrent.futures.as_completed(futures)
+    for f in tqdm.tqdm(f_iter, total=len(futures)):
+        y, x = futures.pop(f)
         labels_nucleus, labels_cell = f.result()
         # Make an in-memory copy of the slice of the dask arrays corresponding
         # to the tile we just segmented. We will operate on the copies, writing
@@ -213,32 +244,31 @@ def main():
         labels_full[:, y : y + tw, x : x + tw] = lf_window
         mask_discard[y : y + tw, x : x + tw] = md_window
 
-    # Warn if there are any objects in discard_mask that are wider than the tile
-    # overlap. This is a hint that the overlap should possibly be increased.
-    mask_discard = da.from_zarr(mask_discard)
-    labels_discard, _ = dim.label(mask_discard)
-    objects_discard = dim.find_objects(labels_discard)
-    discard_count = 0
-    for i, yslice, xslice in objects_discard.itertuples():
-        ysize = yslice.stop - yslice.start
-        xsize = xslice.stop - xslice.start
-        if ysize >= overlap or xsize >= overlap:
-            print(
-                f"WARNING: Found some large cells spanning an entire tile overlap that"
-                f" could not be segmented"
-            )
-            break
-
     end = int(time.perf_counter())
     print("\nelapsed (cellpose):", datetime.timedelta(seconds=end - start))
 
-    labeled_mask = labels_full
-
-    end = int(time.perf_counter())
-    print("\nelapsed (label):", datetime.timedelta(seconds=end - start))
+    large_objects = 0
+    for y, x in tqdm.tqdm(list(itertools.product(ys, xs))):
+        dtile = get_tile(mask_discard, y, x)
+        dtile = skimage.morphology.remove_small_objects(dtile, 2)
+        dlabels = skimage.measure.label(dtile)
+        for p in skimage.measure.regionprops(dlabels):
+            oh = p.bbox[2] - p.bbox[0]
+            ow = p.bbox[3] - p.bbox[1]
+            if (
+                ((p.bbox[0] == 0 or p.bbox[2] == dtile.shape[0]) and oh >= overlap)
+                or ((p.bbox[1] == 0 or p.bbox[3] == dtile.shape[1]) and ow >= overlap)
+            ):
+                large_objects += 1
+    large_objects = round(large_objects / 2)
+    if large_objects:
+        print(
+            f"WARNING: Found {large_objects} large cells spanning an entire tile overlap"
+            f" that could not be segmented"
+        )
 
     palom.pyramid.write_pyramid(
-        [da.from_zarr(labeled_mask)],
+        [da.from_zarr(labels_full)],
         args.output,
         pixel_size=reader.pixel_size,
         downscale_factor=2,
@@ -246,6 +276,9 @@ def main():
         save_RAM=True,
         is_mask=True,
     )
+
+    if args.output_discard:
+        tifffile.imwrite(args.output_discard, mask_discard, tile=mask_discard.chunks)
 
     end = int(time.perf_counter())
     print("\nelapsed (total):", datetime.timedelta(seconds=end - start))
