@@ -10,18 +10,15 @@ import pathlib
 import sys
 import time
 
-import cellpose.denoise
-import dask.array as da
-import dask.diagnostics
-import numcodecs
+import cellpose.models
+import dask.array
+import dask.config
 import ome_types
-import palom
 import skimage.exposure
 import skimage.segmentation
 import sklearn.mixture
 import threadpoolctl
 import tifffile
-import torch.cuda
 import tqdm
 import zarr
 import numpy as np
@@ -43,29 +40,13 @@ def segment_tile(timg, dn_model, intensity_max, cytoplasm_thickness):
     return labels_nucleus, labels_cell
 
 
-def da_to_zarr(da_img, zarr_store=None, num_workers=None, out_shape=None, chunks=None):
-    if zarr_store is None:
-        if out_shape is None:
-            out_shape = da_img.shape
-        if chunks is None:
-            chunks = da_img.chunksize
-        zarr_store = zarr.create(
-            out_shape, chunks=chunks, dtype=da_img.dtype, overwrite=True
-        )
-    with dask.diagnostics.ProgressBar():
-        da_img.to_zarr(zarr_store, compute=False).compute(num_workers=2)
-    return zarr_store
-
-
 def auto_threshold(img):
 
     assert img.ndim == 2
 
-    yi, xi = np.floor(np.linspace(0, img.shape, 200, endpoint=False)).astype(int).T
-    # Slice one dimension at a time. Should generally use less memory than a meshgrid.
-    img = img[yi]
-    img = img[:, xi]
-    img_log = np.log(img[img > 0]).compute()
+    ys, xs = (slice(0, s, np.ceil(s / 200).astype(int)) for s in img.shape)
+    img = img[ys, xs]
+    img_log, img_max = dask.compute(np.log(img[img > 0]), img.max())
     gmm = sklearn.mixture.GaussianMixture(3, max_iter=1000, tol=1e-6)
     gmm.fit(img_log.reshape((-1,1)))
     means = gmm.means_[:, 0]
@@ -74,9 +55,19 @@ def auto_threshold(img):
     std = gmm.covariances_[i, 0, 0] ** 0.5
 
     lmax = mean + 2 * std
-    vmax = min(np.exp(lmax), img.max())
+    vmax = min(np.exp(lmax), img_max)
 
     return vmax
+
+
+def pad_block(zarray, c):
+    """Return block c from zarray, padded to the full chunk size"""
+    img = zarray.blocks[c]
+    diff = np.subtract(zarray.chunks, img.shape)
+    if any(diff > 0):
+        pad_width = np.vstack([np.zeros(len(diff), int), diff]).T
+        img = np.pad(img, pad_width)
+    return img
 
 
 def get_low_res(reader):
@@ -122,6 +113,12 @@ def main():
         help='Number of microns to expand nuclei masks to obtain cytoplasm masks',
     )
     parser.add_argument(
+        '--pixel-size',
+        type=float,
+        help="Pixel size (nominal image resolution) in microns. You may omit"
+        " this if your input OME-TIFF contains accurate pixel size metadata.",
+    )
+    parser.add_argument(
         '--use-gpu',
         action='store_true',
         help='Enable GPU-based processing for CellPose (default: no, use CPU)'
@@ -159,15 +156,24 @@ def main():
     start = int(time.perf_counter())
 
     threadpoolctl.threadpool_limits(1)
+    pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
+    if args.use_gpu:
+        dask.config.set(pool=pool)
 
-    reader = palom.reader.OmePyramidReader(args.input)
-    img = reader.pyramid[0][args.channel - 1]
-    expand_size_px = round(args.expand_size / reader.pixel_size)
-    intensity_max = auto_threshold(img)
+    tiff = tifffile.TiffFile(args.input)
+    ome = ome_types.from_xml(tiff.ome_metadata)
+    if args.pixel_size:
+        pixel_size = args.pixel_size
+    else:
+        pixel_size = ome.images[0].pixels.physical_size_x_quantity.to("micron").m
+        print(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
+    img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0))
+    expand_size_px = round(args.expand_size / pixel_size)
+    intensity_max = auto_threshold(dask.array.from_zarr(img))
     dn_model = cellpose.models.CellposeModel(gpu=args.use_gpu, model_type='nuclei')
 
     tw = args.tile_width
-    overlap = round(args.tile_overlap / reader.pixel_size)
+    overlap = round(args.tile_overlap / pixel_size)
 
     step = tw - overlap
     ys = np.arange(0, img.shape[0], step)
@@ -176,9 +182,8 @@ def main():
         'temp_labels.zarr',
         mode='w',
         shape=(2,) + img.shape,
-        chunks=(2, tw, tw),
+        chunks=(1, tw, tw),
         dtype=np.uint32,
-        compressor=numcodecs.Zstd(),
     )
     mask_discard = zarr.open(
         'temp_discard.zarr',
@@ -186,7 +191,6 @@ def main():
         shape=img.shape,
         chunks=(tw, tw),
         dtype=bool,
-        compressor=numcodecs.Zstd(),
     )
     num_masks = 0
 
@@ -198,7 +202,6 @@ def main():
             get_tile(img, y, x), dn_model, intensity_max, expand_size_px
         )
 
-    pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
     futures = {
         pool.submit(work, y, x): (y, x)
         for y, x in itertools.product(ys, xs)
@@ -207,9 +210,9 @@ def main():
     for f in tqdm.tqdm(f_iter, total=len(futures)):
         y, x = futures.pop(f)
         labels_nucleus, labels_cell = f.result()
-        # Make an in-memory copy of the slice of the dask arrays corresponding
+        # Make an in-memory copy of the slice of the zarr arrays corresponding
         # to the tile we just segmented. We will operate on the copies, writing
-        # them back to the dask array after processing all cells in this tile.
+        # them back to the zarr array after processing all cells in this tile.
         lf_window = labels_full[:, y : y + tw, x : x + tw]
         md_window = mask_discard[y : y + tw, x : x + tw]
         lh, lw = labels_nucleus.shape
@@ -240,7 +243,7 @@ def main():
             lf_window[1][pc.slice][pc.image] = num_masks
             # Clear discard mask for this cell since we've seen it now.
             md_window[pc.slice][pc.image] = False
-        # Write working copies back to the dask arrays.
+        # Write working copies back to the zarr arrays.
         labels_full[:, y : y + tw, x : x + tw] = lf_window
         mask_discard[y : y + tw, x : x + tw] = md_window
 
@@ -267,18 +270,29 @@ def main():
             f" that could not be segmented"
         )
 
-    palom.pyramid.write_pyramid(
-        [da.from_zarr(labels_full)],
+    block_coords = (itertools.product(*(range(s) for s in labels_full.cdata_shape)))
+    tifffile.imwrite(
         args.output,
-        pixel_size=reader.pixel_size,
-        downscale_factor=2,
+        (pad_block(labels_full, c) for c in block_coords),
+        shape=labels_full.shape,
+        dtype=labels_full.dtype,
+        tile=(tw, tw),
         compression="zlib",
-        save_RAM=True,
-        is_mask=True,
+        predictor=True,
+        maxworkers=1,
     )
 
     if args.output_discard:
-        tifffile.imwrite(args.output_discard, mask_discard, tile=mask_discard.chunks)
+        block_coords = (itertools.product(*(range(s) for s in mask_discard.cdata_shape)))
+        tifffile.imwrite(
+            args.output_discard,
+            (pad_block(mask_discard, c) for c in block_coords),
+            shape=mask_discard.shape,
+            dtype=mask_discard.dtype,
+            tile=(tw, tw),
+            compression="zlib",
+            maxworkers=1,
+        )
 
     end = int(time.perf_counter())
     print("\nelapsed (total):", datetime.timedelta(seconds=end - start))
