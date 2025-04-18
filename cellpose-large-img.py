@@ -3,16 +3,14 @@
 # ---------------------------------------------------------------------------- #
 import argparse
 import concurrent.futures
-import datetime
-import gc
 import itertools
 import pathlib
 import sys
-import time
 
 import cellpose.models
 import dask.array
 import dask.config
+import logging
 import ome_types
 import skimage.exposure
 import skimage.segmentation
@@ -79,14 +77,59 @@ def get_low_res(reader):
     return reader.pyramid[0]
 
 
+class PrintLogger:
+
+    def info(self, msg):
+        print(msg)
+
+    def warn(self, msg):
+        print("WARNING:", msg)
+
+    def error(self, msg):
+        print("ERROR:", msg)
+
+
+def progress(iterable, logger, **kwargs):
+    if sys.stdout.isatty():
+        t = tqdm.tqdm(iterable, file=sys.stdout, **kwargs)
+    else:
+        f = TqdmLogWrapper(logger)
+        t = tqdm.tqdm(
+            iterable,
+            file=f,
+            ncols=80,
+            mininterval=60,
+            ascii=False,
+            **kwargs,
+        )
+    yield from t
+
+
+class TqdmLogWrapper:
+
+    def __init__(self, logger):
+        self.logger = logger
+
+    def write(self, s):
+        # Emit bar updates (which begin with a CR) as individual messages.
+        if s[0:1] == '\r':
+            self.logger.info(s[1:])
+
+
 def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '-i', '--input', required=True, help='Input image'
+        '-i', '--input',
+        required=True,
+        type=pathlib.Path,
+        help='Input image',
     )
     parser.add_argument(
-        '-o', '--output', required=True, help='Output image'
+        '-o', '--output',
+        required=True,
+        type=pathlib.Path,
+        help='Output image',
     )
     parser.add_argument(
         '-c', '--channel',
@@ -125,6 +168,7 @@ def main():
     )
     parser.add_argument(
         '--output-discard',
+        type=pathlib.Path,
         help='Discard mask output image',
     )
     parser.add_argument(
@@ -139,21 +183,33 @@ def main():
     )
     args = parser.parse_args()
 
-    args.output = pathlib.Path(args.output)
+    if sys.stdout.isatty():
+        logger = PrintLogger()
+    else:
+        logging.basicConfig(
+            format="%(asctime)s.%(msecs)03d %(name)-20s %(levelname)-8s : %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            level=logging.INFO,
+        )
+        logger = logging.getLogger()
+
     if not args.output.parent.exists():
-        print(
-            f"ERROR: output path parent directoy does not exsit: {args.output.parent}",
-            file=sys.stderr,
+        logger.error(
+            f"Output image parent directory does not exist: {args.output.parent}"
+        )
+        sys.exit(1)
+    if args.output_discard and not args.output_discard.parent.exists():
+        logger.error(
+            "Output discard mask parent directory does not exist:"
+            f" {args.output_discard.parent}"
         )
         sys.exit(1)
     if args.jobs > 1 and not args.use_gpu:
-        print(
-            "ERROR: can't use --jobs without --use-gpu (CPU mode is already"
+        logger.error(
+            "Can't use --jobs without --use-gpu (CPU mode is already"
             " implicitly parallelized; see --help output for details)"
         )
         sys.exit(1)
-
-    start = int(time.perf_counter())
 
     threadpoolctl.threadpool_limits(1)
     pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
@@ -166,7 +222,7 @@ def main():
         pixel_size = args.pixel_size
     else:
         pixel_size = ome.images[0].pixels.physical_size_x_quantity.to("micron").m
-        print(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
+        logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0))
     expand_size_px = round(args.expand_size / pixel_size)
     intensity_max = auto_threshold(dask.array.from_zarr(img))
@@ -202,12 +258,15 @@ def main():
             get_tile(img, y, x), dn_model, intensity_max, expand_size_px
         )
 
+    coords = list(itertools.product(ys, xs))
     futures = {
         pool.submit(work, y, x): (y, x)
-        for y, x in itertools.product(ys, xs)
+        for y, x in coords
     }
     f_iter = concurrent.futures.as_completed(futures)
-    for f in tqdm.tqdm(f_iter, total=len(futures)):
+    for f in progress(
+        f_iter, logger, desc="Segmenting image tiles", total=len(coords)
+    ):
         y, x = futures.pop(f)
         labels_nucleus, labels_cell = f.result()
         # Make an in-memory copy of the slice of the zarr arrays corresponding
@@ -246,12 +305,10 @@ def main():
         # Write working copies back to the zarr arrays.
         labels_full[:, y : y + tw, x : x + tw] = lf_window
         mask_discard[y : y + tw, x : x + tw] = md_window
-
-    end = int(time.perf_counter())
-    print("\nelapsed (cellpose):", datetime.timedelta(seconds=end - start))
+    logger.info(f"Segmentation complete -- detected {num_masks} cells")
 
     large_objects = 0
-    for y, x in tqdm.tqdm(list(itertools.product(ys, xs))):
+    for y, x in progress(coords, logger, desc="Checking tile overlaps"):
         dtile = get_tile(mask_discard, y, x)
         dtile = skimage.morphology.remove_small_objects(dtile, 2)
         dlabels = skimage.measure.label(dtile)
@@ -265,11 +322,12 @@ def main():
                 large_objects += 1
     large_objects = round(large_objects / 2)
     if large_objects:
-        print(
-            f"WARNING: Found {large_objects} large cells spanning an entire tile overlap"
-            f" that could not be segmented"
+        logger.warn(
+            f"Found {large_objects} large cells spanning an entire tile overlap"
+            " that could not be segmented"
         )
 
+    logger.info(f"Writing masks to OME-TIFF: {args.output}")
     block_coords = (itertools.product(*(range(s) for s in labels_full.cdata_shape)))
     tifffile.imwrite(
         args.output,
@@ -283,6 +341,7 @@ def main():
     )
 
     if args.output_discard:
+        logger.info(f"Writing discard map to OME-TIFF: {args.output_discard}")
         block_coords = (itertools.product(*(range(s) for s in mask_discard.cdata_shape)))
         tifffile.imwrite(
             args.output_discard,
@@ -293,9 +352,6 @@ def main():
             compression="zlib",
             maxworkers=1,
         )
-
-    end = int(time.perf_counter())
-    print("\nelapsed (total):", datetime.timedelta(seconds=end - start))
 
 
 if __name__ == '__main__':
