@@ -22,13 +22,13 @@ import zarr
 import numpy as np
 
 
-def segment_tile(timg, dn_model, intensity_max, cytoplasm_thickness):
+def segment_tile(timg, dn_model, intensity_max, cytoplasm_thickness, diameter):
     timg = skimage.exposure.rescale_intensity(
         timg, in_range=(0, intensity_max), out_range="float"
     )
     labels_nucleus = dn_model.eval(
         timg,
-        diameter=17.0,
+        diameter=diameter,
         normalize=False,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
@@ -146,14 +146,19 @@ def main():
     parser.add_argument(
         '--tile-overlap',
         type=float,
-        default=50.0,
-        help='Tile overlap in microns',
+        help='Tile overlap in microns (default: --diameter value times 5)',
     )
     parser.add_argument(
         '--expand-size',
         type=float,
         required=True,
         help='Number of microns to expand nuclei masks to obtain cytoplasm masks',
+    )
+    parser.add_argument(
+        '--diameter',
+        type=float,
+        default=10,
+        help='Diameter of cell nuclei in microns (default: 10)',
     )
     parser.add_argument(
         '--pixel-size',
@@ -211,6 +216,9 @@ def main():
         )
         sys.exit(1)
 
+    if args.tile_overlap is None:
+        args.tile_overlap = args.diameter * 5
+
     threadpoolctl.threadpool_limits(1)
     pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
     if args.use_gpu:
@@ -230,6 +238,9 @@ def main():
 
     tw = args.tile_width
     overlap = round(args.tile_overlap / pixel_size)
+    logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
+    diameter = args.diameter / pixel_size
+    logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
 
     step = tw - overlap
     ys = np.arange(0, img.shape[0], step)
@@ -255,7 +266,7 @@ def main():
 
     def work(y, x):
         return segment_tile(
-            get_tile(img, y, x), dn_model, intensity_max, expand_size_px
+            get_tile(img, y, x), dn_model, intensity_max, expand_size_px, diameter
         )
 
     coords = list(itertools.product(ys, xs))
