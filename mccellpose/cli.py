@@ -1,6 +1,3 @@
-# ---------------------------------------------------------------------------- #
-#                              Process large image                             #
-# ---------------------------------------------------------------------------- #
 import argparse
 import concurrent.futures
 import itertools
@@ -118,7 +115,10 @@ class TqdmLogWrapper:
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Run cellpose on an OME-TIFF using overlapping tiles for"
+        " memory efficiency.",
+    )
     parser.add_argument(
         '-i', '--input',
         required=True,

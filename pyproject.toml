@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mccellpose"
+dynamic = ["version"]
+dependencies = [
+    "cellpose",
+    "dask",
+    "pint",
+    "ome_types",
+    "scikit-image",
+    "scikit-learn",
+    "threadpoolctl",
+    "tifffile",
+    "tqdm",
+    "zarr<3",
+    "numpy",
+]
+
+[project.scripts]
+mccellpose = "mccellpose.cli:main"
+
+[tool.setuptools]
+packages = ["mccellpose"]
+
+[tool.setuptools_scm]
+version_file = "mccellpose/_version.py"
