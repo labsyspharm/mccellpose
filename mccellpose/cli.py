@@ -19,13 +19,12 @@ import zarr
 import numpy as np
 
 
-def segment_tile(timg, dn_model, intensity_max, cytoplasm_thickness, diameter):
+def segment_tile(timg, cp_model, intensity_max, cytoplasm_thickness, diameter):
     timg = skimage.exposure.rescale_intensity(
         timg, in_range=(0, intensity_max), out_range="float"
     )
-    labels_nucleus = dn_model.eval(
+    labels_nucleus = cp_model.eval(
         timg,
-        diameter=diameter,
         normalize=False,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
@@ -231,10 +230,11 @@ def main():
     else:
         pixel_size = ome.images[0].pixels.physical_size_x_quantity.to("micron").m
         logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
-    img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0))
+    img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
     expand_size_px = round(args.expand_size / pixel_size)
     intensity_max = auto_threshold(dask.array.from_zarr(img))
-    dn_model = cellpose.models.CellposeModel(gpu=args.use_gpu, model_type='nuclei')
+    logger.info(f"Rescaling intensity to auto-detected upper limit: {intensity_max}")
+    cp_model = cellpose.models.CellposeModel(gpu=args.use_gpu)
 
     tw = args.tile_width
     overlap = round(args.tile_overlap / pixel_size)
@@ -266,7 +266,7 @@ def main():
 
     def work(y, x):
         return segment_tile(
-            get_tile(img, y, x), dn_model, intensity_max, expand_size_px, diameter
+            get_tile(img, y, x), cp_model, intensity_max, expand_size_px, diameter
         )
 
     coords = list(itertools.product(ys, xs))

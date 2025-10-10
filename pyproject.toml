@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mccellpose"
 dynamic = ["version"]
 dependencies = [
-    "cellpose",
+    "cellpose>=4.0.5",
     "dask",
     "pint",
     "ome_types",
@@ -15,7 +15,7 @@ dependencies = [
     "threadpoolctl",
     "tifffile",
     "tqdm",
-    "zarr<3",
+    "zarr",
     "numpy",
 ]
 
