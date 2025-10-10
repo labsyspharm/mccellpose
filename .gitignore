@@ -1,3 +1,4 @@
+mccellpose/_version.py
 scratch/
 temp*.zarr/
 

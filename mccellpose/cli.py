@@ -18,6 +18,8 @@ import tqdm
 import zarr
 import numpy as np
 
+from . import __version__
+
 
 def segment_tile(timg, cp_model, intensity_max, cytoplasm_thickness, diameter):
     timg = skimage.exposure.rescale_intensity(
@@ -185,6 +187,7 @@ def main():
         ' without providing a speedup. CPU processing is already implicitly'
         ' parallelized and will automatically use all available CPUs.',
     )
+    parser.add_argument('--version', action='version', version=f'mccellpose {__version__}')
     args = parser.parse_args()
 
     if sys.stdout.isatty():

@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
+requires = ["setuptools>=80", "setuptools-scm>=8.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mccellpose"
 dynamic = ["version"]
 dependencies = [
-    "cellpose>=4.0.5",
+    "cellpose>=4.0.7",
     "dask",
     "pint",
     "ome_types",
