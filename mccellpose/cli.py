@@ -127,10 +127,10 @@ def main():
         help='Input image',
     )
     parser.add_argument(
-        '-o', '--output',
+        '-o', '--output-cell',
         required=True,
         type=pathlib.Path,
-        help='Output image',
+        help='Output label image for cell segmentation masks',
     )
     parser.add_argument(
         '-c', '--channel',
@@ -200,9 +200,9 @@ def main():
         )
         logger = logging.getLogger()
 
-    if not args.output.parent.exists():
+    if not args.output_cell.parent.exists():
         logger.error(
-            f"Output image parent directory does not exist: {args.output.parent}"
+            f"Output image parent directory does not exist: {args.output_cell.parent}"
         )
         sys.exit(1)
     if args.output_discard and not args.output_discard.parent.exists():
@@ -231,7 +231,13 @@ def main():
     if args.pixel_size:
         pixel_size = args.pixel_size
     else:
-        pixel_size = ome.images[0].pixels.physical_size_x_quantity.to("micron").m
+        ppsx = ome.images[0].pixels.physical_size_x_quantity
+        if ppsx is None:
+            logger.error(
+                "Input image has no pixel size metadata; please specify --pixel-size"
+            )
+            sys.exit(1)
+        pixel_size = ppsx.to("micron").m
         logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
     expand_size_px = round(args.expand_size / pixel_size)
@@ -341,12 +347,13 @@ def main():
             " that could not be segmented"
         )
 
-    logger.info(f"Writing masks to OME-TIFF: {args.output}")
-    block_coords = (itertools.product(*(range(s) for s in labels_full.cdata_shape)))
+    logger.info(f"Writing cell masks to OME-TIFF: {args.output_cell}")
+    # We only write out full-cell masks, for now (the second channel of labels_full).
+    block_coords = ((1,) + c for c in itertools.product(*(range(s) for s in labels_full.cdata_shape[1:])))
     tifffile.imwrite(
-        args.output,
+        args.output_cell,
         (pad_block(labels_full, c) for c in block_coords),
-        shape=labels_full.shape,
+        shape=labels_full.shape[1:],
         dtype=labels_full.dtype,
         tile=(tw, tw),
         compression="zlib",
