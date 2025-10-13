@@ -256,6 +256,10 @@ def main():
         logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
 
     tw = args.tile_width
+    if tw % 16 != 0:
+        logger.error("--tile-width value must be a multiple of 16")
+        sys.exit(1)
+
     overlap = round(args.tile_overlap / pixel_size)
     logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
     if overlap < 3:
