@@ -254,21 +254,36 @@ def main():
             sys.exit(1)
         pixel_size = ppsx.to("micron").m
         logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
+
+    tw = args.tile_width
+    overlap = round(args.tile_overlap / pixel_size)
+    logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
+    if overlap < 3:
+        logger.warn(
+            "Tile overlap is very small (less than 3 pixels) -- many cells are"
+            " likely to be missed"
+        )
+    diameter = args.diameter / pixel_size
+    logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
+
+    logger.info("Computing image contrast...")
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
     expand_size_px = round(args.expand_size / pixel_size)
     intensity_max = auto_threshold(dask.array.from_zarr(img))
     logger.info(f"Rescaling intensity to auto-detected upper limit: {intensity_max}")
     cp_model = cellpose.models.CellposeModel(gpu=args.use_gpu)
 
-    tw = args.tile_width
-    overlap = round(args.tile_overlap / pixel_size)
-    logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
-    diameter = args.diameter / pixel_size
-    logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
-
     step = tw - overlap
-    ys = np.arange(0, img.shape[0], step)
-    xs = np.arange(0, img.shape[1], step)
+    # Subtract 1 from image dimensions when computing the upper limit for the
+    # rolling window to omit any edge windows with a width or height of 1. This
+    # works around a bug in cellpose where the gradient array is squeezed to
+    # eliminate some intermediate singleton dimensions and inadvertently drops
+    # this real length-1 dimension in our tiles. A 1-pixel edge window would be
+    # fully covered by the overlap from the previous window anyway, so skipping
+    # these windows doesn't affect our results.
+    # FIXME: Omit edge windows up to the full overlap size too?
+    ys = np.arange(0, img.shape[0] - 1, step)
+    xs = np.arange(0, img.shape[1] - 1, step)
     labels_full = zarr.open(
         'temp_labels.zarr',
         mode='w',
