@@ -133,6 +133,11 @@ def main():
         help='Output label image for cell segmentation masks',
     )
     parser.add_argument(
+        '--output-nucleus',
+        type=pathlib.Path,
+        help='Output label image for nucleus segmentation masks (optional)',
+    )
+    parser.add_argument(
         '-c', '--channel',
         type=int,
         required=True,
@@ -200,9 +205,19 @@ def main():
         )
         logger = logging.getLogger()
 
+    if not args.input.exists():
+        logger.error(
+            f"Input image file does not exist: {args.input}"
+        )
+        sys.exit(1)
     if not args.output_cell.parent.exists():
         logger.error(
-            f"Output image parent directory does not exist: {args.output_cell.parent}"
+            f"Output cell mask parent directory does not exist: {args.output_cell.parent}"
+        )
+        sys.exit(1)
+    if args.output_nucleus and not args.output_nucleus.parent.exists():
+        logger.error(
+            f"Output nucleus mask parent directory does not exist: {args.output_nucleus.parent}"
         )
         sys.exit(1)
     if args.output_discard and not args.output_discard.parent.exists():
@@ -347,19 +362,25 @@ def main():
             " that could not be segmented"
         )
 
-    logger.info(f"Writing cell masks to OME-TIFF: {args.output_cell}")
-    # We only write out full-cell masks, for now (the second channel of labels_full).
-    block_coords = ((1,) + c for c in itertools.product(*(range(s) for s in labels_full.cdata_shape[1:])))
-    tifffile.imwrite(
-        args.output_cell,
-        (pad_block(labels_full, c) for c in block_coords),
-        shape=labels_full.shape[1:],
-        dtype=labels_full.dtype,
-        tile=(tw, tw),
-        compression="zlib",
-        predictor=True,
-        maxworkers=1,
-    )
+    block_coords = [
+        [(m,) + c for c in itertools.product(*(range(s) for s in labels_full.cdata_shape[1:]))]
+        for m in (0, 1)
+    ]
+    outputs = [("cell", args.output_cell, block_coords[1])]
+    if args.output_nucleus:
+        outputs.append(("nucleus", args.output_nucleus, block_coords[0]))
+    for name, out_path, coords in outputs:
+        logger.info(f"Writing {name} masks to OME-TIFF: {out_path}")
+        tifffile.imwrite(
+            out_path,
+            (pad_block(labels_full, c) for c in coords),
+            shape=labels_full.shape[1:],
+            dtype=labels_full.dtype,
+            tile=(tw, tw),
+            compression="zlib",
+            predictor=True,
+            maxworkers=1,
+        )
 
     if args.output_discard:
         logger.info(f"Writing discard map to OME-TIFF: {args.output_discard}")
