@@ -364,7 +364,7 @@ def main():
     large_objects = 0
     for y, x in progress(coords, logger, desc="Checking tile overlaps"):
         dtile = get_tile(mask_discard, y, x)
-        dtile = skimage.morphology.remove_small_objects(dtile, 2)
+        dtile = skimage.morphology.remove_small_objects(dtile, max_size=1)
         dlabels = skimage.measure.label(dtile)
         for p in skimage.measure.regionprops(dlabels):
             oh = p.bbox[2] - p.bbox[0]

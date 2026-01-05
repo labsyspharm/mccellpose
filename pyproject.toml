@@ -10,7 +10,7 @@ dependencies = [
     "dask",
     "pint",
     "ome_types",
-    "scikit-image",
+    "scikit-image>=0.26",
     "scikit-learn",
     "threadpoolctl",
     "tifffile",
