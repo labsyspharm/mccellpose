@@ -5,11 +5,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV NUMBA_CACHE_DIR=/tmp
-ENV CELLPOSE_LOCAL_MODELS_PATH=/tmp
+ENV CELLPOSE_LOCAL_MODELS_PATH=/opt/cellpose
 
 COPY / /app
 # 1. Install the app itself.
 # 2. Download the needed model weights.
 RUN pip install --no-cache-dir /app \
+    && mkdir -p $CELLPOSE_LOCAL_MODELS_PATH \
     && python -c "import cellpose.models; cellpose.models.CellposeModel()" \
-    && chmod -R a+rw /tmp
+    && chmod -R a+rw /tmp $CELLPOSE_LOCAL_MODELS_PATH
