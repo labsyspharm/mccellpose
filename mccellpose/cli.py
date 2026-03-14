@@ -28,6 +28,7 @@ def segment_tile(timg, cp_model, intensity_max, cytoplasm_thickness, diameter):
     labels_nucleus = cp_model.eval(
         timg,
         normalize=False,
+        diameter=diameter,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
         labels_nucleus, cytoplasm_thickness
