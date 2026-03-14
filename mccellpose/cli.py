@@ -22,6 +22,9 @@ from . import __version__
 
 
 def segment_tile(timg, cp_model, intensity_max, cytoplasm_thickness, diameter):
+    if np.min(timg) == np.max(timg):
+        return np.zeros(timg.shape, dtype="int32"), np.zeros(timg.shape, dtype="int32")
+
     timg = skimage.exposure.rescale_intensity(
         timg, in_range=(0, intensity_max), out_range="float"
     )
