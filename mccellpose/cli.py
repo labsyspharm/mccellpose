@@ -59,14 +59,74 @@ def auto_threshold(img):
     return vmax
 
 
-def pad_block(zarray, c):
-    """Return block c from zarray, padded to the full chunk size"""
-    img = zarray.blocks[c]
-    diff = np.subtract(zarray.chunks, img.shape)
-    if any(diff > 0):
-        pad_width = np.vstack([np.zeros(len(diff), int), diff]).T
-        img = np.pad(img, pad_width)
-    return img
+def write_label_pyramid(
+    level0, out_path, pixel_size, tile, predictor=True, tmp_prefix="temp_pyramid"
+):
+    """Write a 2-D label array as a tiled, pyramidal OME-TIFF with pixel size metadata"""
+    x = level0 if isinstance(level0, dask.array.Array) else dask.array.from_zarr(level0)
+    dtype = x.dtype
+    levels = [x]
+    i = 1
+    while max(levels[-1].shape) > tile:
+        prev = levels[-1].rechunk((tile * 2, tile * 2))
+        # Downsample by strided slicing rather than averaging so label IDs are
+        # preserved exactly. Rechunk to twice the tile size first so each block
+        # strides down to exactly one tile and the chunk edges stay even, which
+        # makes striding each block in isolation match striding the whole level.
+        out_chunks = tuple(tuple(-(-c // 2) for c in ax) for ax in prev.chunks)
+        down = prev.map_blocks(lambda b: b[::2, ::2], dtype=dtype, chunks=out_chunks)
+        # Materialise each coarse level to a temp zarr before building the next so
+        # memory stays bounded regardless of slide size.
+        z = zarr.open(
+            f"{tmp_prefix}_l{i}.zarr",
+            mode="w",
+            shape=down.shape,
+            chunks=(tile, tile),
+            dtype=dtype,
+        )
+        dask.array.store(down, z)
+        levels.append(dask.array.from_zarr(z))
+        i += 1
+
+    def tiles(arr):
+        h, w = arr.shape
+        for r in range(0, h, tile):
+            for c in range(0, w, tile):
+                block = np.ascontiguousarray(arr[r : r + tile, c : c + tile])
+                # Pad edge tiles up to the full tile size, as TIFF requires.
+                ph, pw = tile - block.shape[0], tile - block.shape[1]
+                if ph or pw:
+                    block = np.pad(block, ((0, ph), (0, pw)))
+                yield block
+
+    opts = dict(
+        tile=(tile, tile),
+        compression="zlib",
+        resolution=(1e4 / pixel_size, 1e4 / pixel_size),
+        resolutionunit="CENTIMETER",
+        maxworkers=1,
+    )
+    if predictor:
+        opts["predictor"] = True
+    with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tif:
+        tif.write(
+            tiles(levels[0]),
+            shape=tuple(levels[0].shape),
+            dtype=dtype,
+            subifds=len(levels) - 1,
+            metadata={
+                "axes": "YX",
+                "PhysicalSizeX": pixel_size,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": pixel_size,
+                "PhysicalSizeYUnit": "µm",
+            },
+            **opts,
+        )
+        for lv in levels[1:]:
+            tif.write(
+                tiles(lv), shape=tuple(lv.shape), dtype=dtype, subfiletype=1, **opts
+            )
 
 
 def get_low_res(reader):
@@ -256,7 +316,7 @@ def main():
             )
             sys.exit(1)
         pixel_size = ppsx.to("micron").m
-        logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
+        logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} µm")
 
     tw = args.tile_width
     if tw % 16 != 0:
@@ -264,14 +324,14 @@ def main():
         sys.exit(1)
 
     overlap = round(args.tile_overlap / pixel_size)
-    logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
+    logger.info(f"Tile overlap: {args.tile_overlap} µm ({overlap} px)")
     if overlap < 3:
         logger.warn(
             "Tile overlap is very small (less than 3 pixels) -- many cells are"
             " likely to be missed"
         )
     diameter = args.diameter / pixel_size
-    logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
+    logger.info(f"Expected nucleus diameter: {args.diameter} µm ({diameter} px)")
 
     logger.info("Computing image contrast...")
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
@@ -384,37 +444,31 @@ def main():
             " that could not be segmented"
         )
 
-    block_coords = [
-        [(m,) + c for c in itertools.product(*(range(s) for s in labels_full.cdata_shape[1:]))]
-        for m in (0, 1)
-    ]
-    outputs = [("cell", args.output_cell, block_coords[1])]
+    # channel 0 = nucleus, 1 = cell in the labels_full zarr
+    outputs = [("cell", args.output_cell, 1)]
     if args.output_nucleus:
-        outputs.append(("nucleus", args.output_nucleus, block_coords[0]))
-    for name, out_path, coords in outputs:
-        logger.info(f"Writing {name} masks to OME-TIFF: {out_path}")
-        tifffile.imwrite(
+        outputs.append(("nucleus", args.output_nucleus, 0))
+    labels_da = dask.array.from_zarr(labels_full)
+    for name, out_path, m in outputs:
+        logger.info(f"Writing {name} masks to pyramidal OME-TIFF: {out_path}")
+        write_label_pyramid(
+            labels_da[m],
             out_path,
-            (pad_block(labels_full, c) for c in coords),
-            shape=labels_full.shape[1:],
-            dtype=labels_full.dtype,
-            tile=(tw, tw),
-            compression="zlib",
+            pixel_size,
+            tw,
             predictor=True,
-            maxworkers=1,
+            tmp_prefix=f"temp_pyramid_{name}",
         )
 
     if args.output_discard:
-        logger.info(f"Writing discard map to OME-TIFF: {args.output_discard}")
-        block_coords = (itertools.product(*(range(s) for s in mask_discard.cdata_shape)))
-        tifffile.imwrite(
+        logger.info(f"Writing discard map to pyramidal OME-TIFF: {args.output_discard}")
+        write_label_pyramid(
+            dask.array.from_zarr(mask_discard),
             args.output_discard,
-            (pad_block(mask_discard, c) for c in block_coords),
-            shape=mask_discard.shape,
-            dtype=mask_discard.dtype,
-            tile=(tw, tw),
-            compression="zlib",
-            maxworkers=1,
+            pixel_size,
+            tw,
+            predictor=False,
+            tmp_prefix="temp_pyramid_discard",
         )
 
 
