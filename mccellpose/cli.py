@@ -59,61 +59,61 @@ def auto_threshold(img):
     return vmax
 
 
-def write_label_pyramid(
-    level0, out_path, pixel_size, tile, predictor=True, tmp_prefix="temp_pyramid"
-):
+def write_label_pyramid(level0, out_path, pixel_size, tile, predictor=True):
     """Write a 2-D label array as a tiled, pyramidal OME-TIFF with pixel size metadata"""
     x = level0 if isinstance(level0, dask.array.Array) else dask.array.from_zarr(level0)
     dtype = x.dtype
-    levels = [x]
-    i = 1
-    while max(levels[-1].shape) > tile:
-        prev = levels[-1].rechunk((tile * 2, tile * 2))
-        # Downsample by strided slicing rather than averaging so label IDs are
-        # preserved exactly. Rechunk to twice the tile size first so each block
-        # strides down to exactly one tile and the chunk edges stay even, which
-        # makes striding each block in isolation match striding the whole level.
-        out_chunks = tuple(tuple(-(-c // 2) for c in ax) for ax in prev.chunks)
-        down = prev.map_blocks(lambda b: b[::2, ::2], dtype=dtype, chunks=out_chunks)
-        # Materialise each coarse level to a temp zarr before building the next so
-        # memory stays bounded regardless of slide size.
-        z = zarr.open(
-            f"{tmp_prefix}_l{i}.zarr",
-            mode="w",
-            shape=down.shape,
-            chunks=(tile, tile),
-            dtype=dtype,
-        )
-        dask.array.store(down, z)
-        levels.append(dask.array.from_zarr(z))
-        i += 1
+    base_shape = tuple(x.shape)
+    # Number of factor-2 levels needed to bring the largest dimension down to a
+    # single tile. Each coarser level's shape is the previous level's shape
+    # halved and rounded up, matching the strided downsampling below.
+    num_levels = max(int(np.ceil(np.log2(max(base_shape) / tile))) + 1, 1)
+    shapes = [tuple(-(-s // 2 ** i) for s in base_shape) for i in range(num_levels)]
 
-    def tiles(arr):
-        h, w = arr.shape
+    def base_tiles():
+        h, w = base_shape
         for r in range(0, h, tile):
             for c in range(0, w, tile):
-                block = np.ascontiguousarray(arr[r : r + tile, c : c + tile])
-                # Pad edge tiles up to the full tile size, as TIFF requires.
-                ph, pw = tile - block.shape[0], tile - block.shape[1]
-                if ph or pw:
-                    block = np.pad(block, ((0, ph), (0, pw)))
-                yield block
+                yield np.ascontiguousarray(x[r : r + tile, c : c + tile])
+
+    def subres_tiles(level):
+        # Build this level by reading the previous level back from the output
+        # file as it is being written. is_ome=False because the OME-XML is only
+        # finalised on writer close.
+        tiff = tifffile.TiffFile(out_path, is_ome=False)
+        try:
+            prev = zarr.open(tiff.series[0].aszarr(level=level - 1), mode="r")
+            h, w = prev.shape
+            step = tile * 2
+            for r in range(0, h, step):
+                for c in range(0, w, step):
+                    # Downsample by strided slicing rather than averaging so
+                    # label IDs are preserved.
+                    block = prev[r : r + step, c : c + step]
+                    yield np.ascontiguousarray(block[::2, ::2])
+        finally:
+            tiff.close()
 
     opts = dict(
         tile=(tile, tile),
-        compression="zlib",
+        # zstd is both faster and ~20% smaller than zlib.
+        compression="zstd",
         resolution=(1e4 / pixel_size, 1e4 / pixel_size),
         resolutionunit="CENTIMETER",
-        maxworkers=1,
+        # Leave maxworkers at tifffile's default rather than forcing 1. It
+        # compresses tiles across ~half the available cores -- CPU-affinity
+        # aware on Linux, None-safe, and overridable via TIFFFILE_NUM_THREADS.
+        # Pyramid writing is its own phase after segmentation, so the cores are
+        # otherwise idle, and ~half-cores already sits near the speedup knee.
     )
     if predictor:
         opts["predictor"] = True
     with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tif:
         tif.write(
-            tiles(levels[0]),
-            shape=tuple(levels[0].shape),
+            base_tiles(),
+            shape=base_shape,
             dtype=dtype,
-            subifds=len(levels) - 1,
+            subifds=num_levels - 1,
             metadata={
                 "axes": "YX",
                 "PhysicalSizeX": pixel_size,
@@ -123,9 +123,13 @@ def write_label_pyramid(
             },
             **opts,
         )
-        for lv in levels[1:]:
+        for level in range(1, num_levels):
             tif.write(
-                tiles(lv), shape=tuple(lv.shape), dtype=dtype, subfiletype=1, **opts
+                subres_tiles(level),
+                shape=shapes[level],
+                dtype=dtype,
+                subfiletype=1,
+                **opts,
             )
 
 
@@ -457,7 +461,6 @@ def main():
             pixel_size,
             tw,
             predictor=True,
-            tmp_prefix=f"temp_pyramid_{name}",
         )
 
     if args.output_discard:
@@ -468,7 +471,6 @@ def main():
             pixel_size,
             tw,
             predictor=False,
-            tmp_prefix="temp_pyramid_discard",
         )
 
 
