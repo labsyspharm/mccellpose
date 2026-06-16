@@ -21,12 +21,12 @@ import numpy as np
 from . import __version__
 
 
-def segment_tile(timg, cp_model, intensity_max, cytoplasm_thickness, diameter):
+def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter):
     if np.ptp(timg) == 0:
         return np.zeros(timg.shape, dtype="int32"), np.zeros(timg.shape, dtype="int32")
 
     timg = skimage.exposure.rescale_intensity(
-        timg, in_range=(0, intensity_max), out_range="float"
+        timg, in_range=contrast_limits, out_range="float"
     )
     labels_nucleus = cp_model.eval(
         timg,
@@ -176,6 +176,14 @@ def main():
         " this if your input OME-TIFF contains accurate pixel size metadata.",
     )
     parser.add_argument(
+        '--contrast-limits',
+        type=float,
+        nargs=2,
+        metavar=('MIN', 'MAX'),
+        help="Intensity value limits for pre-scaling the image before"
+        " segmentation. Auto-detected from the image if not specified.",
+    )
+    parser.add_argument(
         '--use-gpu',
         action='store_true',
         help='Enable GPU-based processing for CellPose (default: no, use CPU)'
@@ -273,11 +281,18 @@ def main():
     diameter = args.diameter / pixel_size
     logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
 
-    logger.info("Computing image contrast...")
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
     expand_size_px = round(args.expand_size / pixel_size)
-    intensity_max = auto_threshold(dask.array.from_zarr(img))
-    logger.info(f"Rescaling intensity to auto-detected upper limit: {intensity_max}")
+
+    if args.contrast_limits:
+        contrast_limits = tuple(args.contrast_limits)
+        logger.info(f"Rescaling intensity to user-specified limits: {contrast_limits}")
+    else:
+        logger.info("Computing image contrast...")
+        intensity_max = float(auto_threshold(dask.array.from_zarr(img)))
+        contrast_limits = (0, intensity_max)
+        logger.info(f"Rescaling intensity to auto-detected limits: {contrast_limits}")
+
     cp_model = cellpose.models.CellposeModel(gpu=args.use_gpu)
 
     step = tw - overlap
@@ -312,7 +327,7 @@ def main():
 
     def work(y, x):
         return segment_tile(
-            get_tile(img, y, x), cp_model, intensity_max, expand_size_px, diameter
+            get_tile(img, y, x), cp_model, contrast_limits, expand_size_px, diameter
         )
 
     coords = list(itertools.product(ys, xs))
