@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mccellpose"
 dynamic = ["version"]
+requires-python = ">=3.11"
 dependencies = [
     "cellpose>=4.0.7",
     "dask",
