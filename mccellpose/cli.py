@@ -31,6 +31,7 @@ def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter)
     labels_nucleus = cp_model.eval(
         timg,
         normalize=False,
+        diameter=diameter,
     )[0]
     labels_cell = skimage.segmentation.expand_labels(
         labels_nucleus, cytoplasm_thickness
@@ -170,6 +171,15 @@ def main():
         help='Diameter of cell nuclei in microns (default: 10)',
     )
     parser.add_argument(
+        '--diameter-rescale',
+        action='store_true',
+        help='Enable CellPose internal image rescaling based on --diameter'
+        ' value. Only enable this if your cells are very large (well over 100'
+        ' pixels in diameter) and are not detected otherwise, but note that'
+        ' small cells may be missed. Be sure to also pass an appropriate'
+        ' value for --diameter.',
+    )
+    parser.add_argument(
         '--pixel-size',
         type=float,
         help="Pixel size (nominal image resolution) in microns. You may omit"
@@ -280,6 +290,12 @@ def main():
         )
     diameter = args.diameter / pixel_size
     logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
+    cp_diameter = None
+    if args.diameter_rescale:
+        if args.diameter == parser.get_default('diameter'):
+            logger.warn("When using --diameter-rescaling, please also provide --diameter")
+        logger.info(f"Requesting cellpose cell diameter rescaling to {diameter} px")
+        cp_diameter = diameter
 
     img = zarr.open(tiff.series[0][args.channel - 1].aszarr(level=0), mode="r")
     expand_size_px = round(args.expand_size / pixel_size)
@@ -327,7 +343,7 @@ def main():
 
     def work(y, x):
         return segment_tile(
-            get_tile(img, y, x), cp_model, contrast_limits, expand_size_px, diameter
+            get_tile(img, y, x), cp_model, contrast_limits, expand_size_px, cp_diameter
         )
 
     coords = list(itertools.product(ys, xs))
