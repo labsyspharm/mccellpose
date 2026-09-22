@@ -60,14 +60,69 @@ def auto_threshold(img):
     return vmax
 
 
-def pad_block(zarray, c):
-    """Return block c from zarray, padded to the full chunk size"""
-    img = zarray.blocks[c]
-    diff = np.subtract(zarray.chunks, img.shape)
-    if any(diff > 0):
-        pad_width = np.vstack([np.zeros(len(diff), int), diff]).T
-        img = np.pad(img, pad_width)
-    return img
+def write_label_pyramid(x, out_path, pixel_size_um, tile, predictor=True):
+    """Write a 2-D label array as a tiled, pyramidal OME-TIFF with pixel size metadata"""
+    dtype = x.dtype
+    base_shape = np.array(x.shape, int)
+    # Number of factor-2 levels needed to bring the largest dimension down to a
+    # single tile. Each coarser level's shape is the previous level's shape
+    # halved and rounded up, matching the strided downsampling below.
+    num_levels = max(int(np.ceil(np.log2(max(base_shape) / tile))) + 1, 1)
+    factors = 2 ** np.arange(num_levels)
+    shapes = np.ceil(base_shape / factors[:, None]).astype(int)
+
+    def base_tiles():
+        h, w = base_shape
+        for r in range(0, h, tile):
+            for c in range(0, w, tile):
+                yield x[r : r + tile, c : c + tile]
+
+    def subres_tiles(level):
+        # Build this level by reading the previous level back from the output
+        # file as it is being written. is_ome=False because the OME-XML is only
+        # finalised on writer close.
+        tiff = tifffile.TiffFile(out_path, is_ome=False)
+        prev = zarr.open(tiff.series[0].aszarr(level=level - 1), mode="r")
+        h, w = prev.shape
+        step = tile * 2
+        for r in range(0, h, step):
+            for c in range(0, w, step):
+                block = prev[r : r + step, c : c + step]
+                # Downsample by strided slicing rather than averaging so
+                # label IDs are preserved.
+                yield block[::2, ::2]
+
+    resolution = 1e4 / pixel_size_um
+    opts = dict(
+        tile=(tile, tile),
+        compression="zlib",
+        predictor=predictor,
+        resolution=(resolution, resolution),
+        resolutionunit="CENTIMETER",
+    )
+    with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tiff:
+        tiff.write(
+            base_tiles(),
+            shape=base_shape,
+            dtype=dtype,
+            subifds=num_levels - 1,
+            metadata={
+                "axes": "YX",
+                "PhysicalSizeX": pixel_size_um,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": pixel_size_um,
+                "PhysicalSizeYUnit": "µm",
+            },
+            **opts,
+        )
+        for level in range(1, num_levels):
+            tiff.write(
+                subres_tiles(level),
+                shape=shapes[level],
+                dtype=dtype,
+                subfiletype=1,
+                **opts,
+            )
 
 
 def get_low_res(reader):
@@ -274,7 +329,7 @@ def main():
             )
             sys.exit(1)
         pixel_size = ppsx.to("micron").m
-        logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} μm")
+        logger.info(f"Pixel size detected from OME-TIFF: {pixel_size} µm")
 
     tw = args.tile_width
     if tw % 16 != 0:
@@ -282,14 +337,14 @@ def main():
         sys.exit(1)
 
     overlap = round(args.tile_overlap / pixel_size)
-    logger.info(f"Tile overlap: {args.tile_overlap} μm ({overlap} px)")
+    logger.info(f"Tile overlap: {args.tile_overlap} µm ({overlap} px)")
     if overlap < 3:
         logger.warn(
             "Tile overlap is very small (less than 3 pixels) -- many cells are"
             " likely to be missed"
         )
     diameter = args.diameter / pixel_size
-    logger.info(f"Expected nucleus diameter: {args.diameter} μm ({diameter} px)")
+    logger.info(f"Expected nucleus diameter: {args.diameter} µm ({diameter} px)")
     cp_diameter = None
     if args.diameter_rescale:
         if args.diameter == parser.get_default('diameter'):
@@ -415,37 +470,28 @@ def main():
             " that could not be segmented"
         )
 
-    block_coords = [
-        [(m,) + c for c in itertools.product(*(range(s) for s in labels_full.cdata_shape[1:]))]
-        for m in (0, 1)
-    ]
-    outputs = [("cell", args.output_cell, block_coords[1])]
+    labels_da = dask.array.from_zarr(labels_full)
+    outputs = [("cell", args.output_cell, labels_da[1])]
     if args.output_nucleus:
-        outputs.append(("nucleus", args.output_nucleus, block_coords[0]))
-    for name, out_path, coords in outputs:
-        logger.info(f"Writing {name} masks to OME-TIFF: {out_path}")
-        tifffile.imwrite(
+        outputs.append(("nucleus", args.output_nucleus, labels_da[0]))
+    for name, out_path, dimg in outputs:
+        logger.info(f"Writing {name} masks to pyramidal OME-TIFF: {out_path}")
+        write_label_pyramid(
+            dimg,
             out_path,
-            (pad_block(labels_full, c) for c in coords),
-            shape=labels_full.shape[1:],
-            dtype=labels_full.dtype,
-            tile=(tw, tw),
-            compression="zlib",
+            pixel_size,
+            tw,
             predictor=True,
-            maxworkers=1,
         )
 
     if args.output_discard:
-        logger.info(f"Writing discard map to OME-TIFF: {args.output_discard}")
-        block_coords = (itertools.product(*(range(s) for s in mask_discard.cdata_shape)))
-        tifffile.imwrite(
+        logger.info(f"Writing discard map to pyramidal OME-TIFF: {args.output_discard}")
+        write_label_pyramid(
+            dask.array.from_zarr(mask_discard),
             args.output_discard,
-            (pad_block(mask_discard, c) for c in block_coords),
-            shape=mask_discard.shape,
-            dtype=mask_discard.dtype,
-            tile=(tw, tw),
-            compression="zlib",
-            maxworkers=1,
+            pixel_size,
+            tw,
+            predictor=False,
         )
 
 
