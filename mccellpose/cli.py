@@ -3,6 +3,7 @@ import concurrent.futures
 import itertools
 import pathlib
 import sys
+import warnings
 
 import cellpose.models
 import dask.array
@@ -14,11 +15,15 @@ import skimage.segmentation
 import sklearn.mixture
 import threadpoolctl
 import tifffile
+import torch
 import tqdm
 import zarr
 import numpy as np
 
 from . import __version__
+
+
+software_version = f"mccellpose {__version__}"
 
 
 def segment_tile(timg, cp_model, contrast_limits, cytoplasm_thickness, diameter):
@@ -107,12 +112,14 @@ def write_label_pyramid(x, out_path, pixel_size_um, tile, predictor=True):
             dtype=dtype,
             subifds=num_levels - 1,
             metadata={
+                "Creator": software_version,
                 "axes": "YX",
                 "PhysicalSizeX": pixel_size_um,
                 "PhysicalSizeXUnit": "µm",
                 "PhysicalSizeY": pixel_size_um,
                 "PhysicalSizeYUnit": "µm",
             },
+            software=software_version,
             **opts,
         )
         for level in range(1, num_levels):
@@ -268,7 +275,7 @@ def main():
         ' without providing a speedup. CPU processing is already implicitly'
         ' parallelized and will automatically use all available CPUs.',
     )
-    parser.add_argument('--version', action='version', version=f'mccellpose {__version__}')
+    parser.add_argument('--version', action='version', version=software_version)
     args = parser.parse_args()
 
     if sys.stdout.isatty():
@@ -309,6 +316,11 @@ def main():
         )
         sys.exit(1)
 
+    logger.info(f'Running {software_version}')
+    for s in cellpose.version_str.split('\n'):
+        logger.info(s)
+    logger.info('')
+
     if args.tile_overlap is None:
         args.tile_overlap = args.diameter * 5
 
@@ -316,6 +328,10 @@ def main():
     pool = concurrent.futures.ThreadPoolExecutor(args.jobs)
     if args.use_gpu:
         dask.config.set(pool=pool)
+
+    # Silence a noisy torch warning. The Cellpose team should decide for
+    # themselves if this is correct but it seems safe to disable.
+    torch.sparse.check_sparse_tensor_invariants.disable()
 
     tiff = tifffile.TiffFile(args.input)
     ome = ome_types.from_xml(tiff.ome_metadata)
