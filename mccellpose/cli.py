@@ -141,12 +141,15 @@ def get_low_res(reader):
     return reader.pyramid[0]
 
 
+# This simple Logger-like class implements just enough for our needs when output is sent to a live
+# tty. We want info() to work like a simple print() call, without emitting the 'INFO:' prefix, but
+# this is difficult and fragile to implement with the actual Logger class.
 class PrintLogger:
 
     def info(self, msg):
         print(msg)
 
-    def warn(self, msg):
+    def warning(self, msg):
         print("WARNING:", msg)
 
     def error(self, msg):
@@ -162,6 +165,11 @@ def progress(iterable, logger, **kwargs):
             iterable,
             file=f,
             ncols=80,
+            # miniters=1 disables the monitor thread, which can cause extra progress bar writes
+            # depending on iteration timing. In normal operation where tqdm keeps overwriting the
+            # same line on the screen this is harmless, but with our log wrapper it gives the
+            # appearance of redundant log lines.
+            miniters=1,
             mininterval=60,
             ascii=False,
             **kwargs,
@@ -279,14 +287,22 @@ def main():
     args = parser.parse_args()
 
     if sys.stdout.isatty():
+        # Simplified output for casual interactive use.
+        logging.basicConfig(
+            format="%(levelname)s: %(name)s: %(message)s",
+            level=logging.INFO,
+        )
         logger = PrintLogger()
     else:
+        # Enhanced configuration suitable for logging to an actual file.
         logging.basicConfig(
             format="%(asctime)s.%(msecs)03d %(name)-20s %(levelname)-8s : %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
             level=logging.INFO,
         )
-        logger = logging.getLogger()
+        logger = logging.getLogger('mccellpose')
+    # INFO is too verbose for cellpose.dynamics.
+    logging.getLogger('cellpose.dynamics').setLevel(logging.WARNING)
 
     if not args.input.exists():
         logger.error(
@@ -355,7 +371,7 @@ def main():
     overlap = round(args.tile_overlap / pixel_size)
     logger.info(f"Tile overlap: {args.tile_overlap} µm ({overlap} px)")
     if overlap < 3:
-        logger.warn(
+        logger.warning(
             "Tile overlap is very small (less than 3 pixels) -- many cells are"
             " likely to be missed"
         )
@@ -364,7 +380,7 @@ def main():
     cp_diameter = None
     if args.diameter_rescale:
         if args.diameter == parser.get_default('diameter'):
-            logger.warn("When using --diameter-rescaling, please also provide --diameter")
+            logger.warning("When using --diameter-rescaling, please also provide --diameter")
         logger.info(f"Requesting cellpose cell diameter rescaling to {diameter} px")
         cp_diameter = diameter
 
@@ -481,7 +497,7 @@ def main():
                 large_objects += 1
     large_objects = round(large_objects / 2)
     if large_objects:
-        logger.warn(
+        logger.warning(
             f"Found {large_objects} large cells spanning an entire tile overlap"
             " that could not be segmented"
         )
@@ -509,6 +525,9 @@ def main():
             tw,
             predictor=False,
         )
+
+    logger.info('')
+    logger.info('Run complete')
 
 
 if __name__ == '__main__':
