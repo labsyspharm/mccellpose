@@ -104,6 +104,7 @@ def write_label_pyramid(x, out_path, pixel_size_um, tile, predictor=True):
         predictor=predictor,
         resolution=(resolution, resolution),
         resolutionunit="CENTIMETER",
+        maxworkers=1,
     )
     with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tiff:
         tiff.write(
